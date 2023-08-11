@@ -1,0 +1,629 @@
+---
+title: "Wrapper"
+author: "Ghaffour Basma"
+date: "2023-07-21"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidymodels)
+library(VSURF)
+library(tidymodels)
+library(kknn)
+library(stargazer)
+library(caret)
+```
+
+```{r}
+
+set.seed(1)
+data<-read.csv("student-mat.csv",sep=";")
+ind_var<-c(1:2,4:29)
+data[,ind_var]<-lapply(data[,ind_var],factor)
+Filtre <- which(rowSums(is.na(data))==0)
+data <- data[Filtre,]
+set.seed(1)
+split_data <- initial_split(data, prop = 0.75, strata = G3)
+data_train <- training(split_data)
+data_test <- testing(split_data)
+
+```
+
+```{r}
+rec<-recipe(G3~.,data=data_train) %>% 
+  step_dummy(all_factor_predictors()) %>% 
+  prep()
+```
+
+
+
+## Régréssion linéaire
+
+```{r}
+set.seed(1)
+filterCtrl2 <- sbfControl(method = "repeatedcv", repeats = 1, verbose=TRUE,functions = lmSBF,number=5)
+```
+
+```{r}
+set.seed(1)
+lmWithFilter <- sbf(rec, sbfControl = filterCtrl2,data=data_train)
+optivar_lm<-lmWithFilter$optVariables
+```
+
+# selection filtre
+
+## Transformation des données
+
+```{r}
+set.seed(1)
+data_trf<-recipe(G3~.,data=data) %>% 
+  step_dummy(all_factor_predictors()) %>% 
+  prep() %>% 
+  juice()
+Filtre <- which(rowSums(is.na(data))==0)
+data <- data[Filtre,]
+set.seed(1)
+split_data <- initial_split(data_trf, prop = 0.75, strata = G3)
+data_train<- training(split_data)
+data_test<- testing(split_data)
+data_cv<-vfold_cv(data_train)
+rec<-recipe(G3~.,data=data_train)
+```
+
+
+```{r}
+
+tree_spec<-decision_tree() %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")
+
+tune_tree_wf<-workflow() %>% 
+  add_model(tree_spec %>% 
+              set_args(cost_complexity=tune())) %>% 
+  add_recipe(rec)
+
+cost_complexity_grid <- grid_regular(cost_complexity(range=c(-5,5)),levels=10)
+
+tree_tune_res<- tune_grid(tune_tree_wf,
+                          resamples=data_cv,
+                          grid=cost_complexity_grid,
+                          metrics=metric_set(rmse))
+
+best_cost_complexity <- select_best(tree_tune_res)
+
+
+final_tune_tree_wf <- tune_tree_wf %>% 
+  finalize_workflow(best_cost_complexity)
+
+tree_fit <- final_tune_tree_wf %>% last_fit(split_data)
+
+
+
+v1<-tree_fit %>% collect_metrics() 
+v1<-t(as.matrix(v1[,3]))
+
+## Random Forest
+
+random_forest_spec <- rand_forest(mtry = tune()) %>% 
+  set_engine("randomForest", importance = TRUE) %>%
+  set_mode("regression")
+
+tune_rf_wf <- workflow() %>% 
+  add_model(random_forest_spec) %>% 
+  add_recipe(rec)
+
+mtry_grid <- data.frame(mtry = 1:71)
+
+rf_tune_res<-tune_grid(
+  tune_rf_wf,
+  resamples=data_cv,
+  grid=mtry_grid,
+  metrics=metric_set(rmse)
+)
+
+best_mtry<-select_best(rf_tune_res)
+
+final_tune_rf_wf<-tune_rf_wf %>% 
+  finalize_workflow(best_mtry)
+
+rf_fit<-final_tune_rf_wf %>% last_fit(split_data)
+
+
+
+v2<-rf_fit %>% collect_metrics()
+v2<-t(as.matrix(v2[,3]))
+
+## SVM linéaire
+
+svm_linear_spec <- svm_poly(degree = 1,cost=tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kernlab")
+
+tune_svml_wf<-workflow() %>% 
+  add_model(svm_linear_spec) %>% 
+  add_recipe(rec)
+
+svm_grid<-grid_regular(cost(),levels=10)
+
+svml_tune_res<-tune_grid(tune_svml_wf,
+                         resamples=data_cv,
+                         grid=svm_grid,
+                         metrics=metric_set(rmse))
+
+best_cost<-select_best(svml_tune_res)
+
+final_tune_svml_wf<-tune_svml_wf %>% 
+  finalize_workflow(best_cost)
+
+svml_fit<-final_tune_svml_wf %>% 
+  last_fit(split_data)
+
+v3<-svml_fit %>% collect_metrics()
+v3<-t(as.matrix(v3[,3]))
+
+## SVR non linéaire
+
+svm_rad_spec<- svm_rbf(cost=tune(),rbf_sigma=tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kernlab")
+
+svm_rad_wf<-
+  workflow() %>%
+  add_model(svm_rad_spec %>%  set_args(cost=tune(),rbf_sigma=tune())) %>%
+  add_recipe(rec)
+
+svm_rad_grid <- svm_rad_wf %>% 
+  parameters() %>%
+  grid_regular(levels=10)
+
+tune_res_svm_rad <- tune_grid(svm_rad_wf,
+                              resamples = data_cv,
+                              grid = svm_rad_grid,
+                              metrics=metric_set(rmse))
+
+svm_rad_best<-select_best(tune_res_svm_rad)
+
+svm_rad_final_wf<-svm_rad_wf %>% 
+  finalize_workflow(svm_rad_best)
+
+rad_svm_fit<-svm_rad_final_wf %>% 
+  last_fit(split_data)
+
+
+v4<-rad_svm_fit %>% collect_metrics()
+v4<-t(as.matrix(v4[,3]))
+
+## Régréssion linaire
+
+
+lm_spec<-linear_reg() %>% set_engine("lm") %>%
+  set_mode("regression") 
+
+lm_wf<-workflow() %>% 
+  add_model(lm_spec) %>% 
+  add_recipe(rec)
+
+lm_fit<-lm_wf %>% 
+  last_fit(split_data)
+
+v5<-lm_fit %>% collect_metrics()
+v5<-t(as.matrix(v5[,3]))
+
+## KNN
+
+knn_spec<-nearest_neighbor(neighbors=tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kknn")
+
+tune_knn_wf<-workflow() %>% 
+  add_model(knn_spec) %>% 
+  add_recipe(rec)
+
+knn_grid<-grid_regular(neighbors(),levels=10)
+
+tune_res_knn<-tune_grid(tune_knn_wf,resamples=data_cv,
+                        grid=knn_grid,metrics = metric_set(rmse))
+
+knn_best<-select_best(tune_res_knn)
+
+final_tune_wf_knn<-tune_knn_wf %>% finalize_workflow(knn_best)
+
+knn_fit<-final_tune_wf_knn %>% last_fit(split_data)
+
+v6<-knn_fit %>% collect_metrics()
+v6<-t(as.matrix(v6[,3]))
+```
+
+
+
+
+
+## Séléction pour régréssion linéaire
+
+```{r}
+names<-colnames(data_trf)
+var_lm<-NULL
+for (i in 1:length(optivar_lm)){
+var_lm[i]<-which(names==optivar_lm[i])
+}
+var_lm
+```
+
+```{r}
+set.seed(1)
+split_data <- initial_split(data_trf[,c(var_lm,5)], prop = 0.75, strata = G3)
+data_train<- training(split_data)
+data_test<- testing(split_data)
+data_cv<-vfold_cv(data_train)
+rec<-recipe(G3~.,data=data_train)
+```
+
+```{r}
+
+tree_spec<-decision_tree() %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")
+
+tune_tree_wf<-workflow() %>% 
+  add_model(tree_spec %>% 
+              set_args(cost_complexity=tune())) %>% 
+  add_recipe(rec)
+
+cost_complexity_grid <- grid_regular(cost_complexity(range=c(-5,5)),levels=10)
+
+tree_tune_res<- tune_grid(tune_tree_wf,
+                          resamples=data_cv,
+                          grid=cost_complexity_grid,
+                          metrics=metric_set(rmse))
+
+best_cost_complexity <- select_best(tree_tune_res)
+
+
+final_tune_tree_wf <- tune_tree_wf %>% 
+  finalize_workflow(best_cost_complexity)
+
+tree_fit <- final_tune_tree_wf %>% last_fit(split_data)
+
+v11<-tree_fit %>% collect_metrics() 
+v11<-t(as.matrix(v11[,3]))
+
+## Random Forest
+
+random_forest_spec <- rand_forest(mtry = tune()) %>% 
+  set_engine("randomForest", importance = TRUE) %>%
+  set_mode("regression")
+
+tune_rf_wf <- workflow() %>% 
+  add_model(random_forest_spec) %>% 
+  add_recipe(rec)
+
+mtry_grid <- data.frame(mtry = 22)
+
+rf_tune_res<-tune_grid(
+  tune_rf_wf,
+  resamples=data_cv,
+  grid=mtry_grid,
+  metrics=metric_set(rmse)
+)
+
+best_mtry<-select_best(rf_tune_res)
+
+final_tune_rf_wf<-tune_rf_wf %>% 
+  finalize_workflow(best_mtry)
+
+rf_fit<-final_tune_rf_wf %>% last_fit(split_data)
+
+v22<-rf_fit %>% collect_metrics()
+v22<-t(as.matrix(v22[,3]))
+
+## SVR linéaire
+
+svm_linear_spec <- svm_poly(degree = 1,cost=tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kernlab")
+
+tune_svml_wf<-workflow() %>% 
+  add_model(svm_linear_spec) %>% 
+  add_recipe(rec)
+
+svm_grid<-grid_regular(cost(),levels=10)
+
+svml_tune_res<-tune_grid(tune_svml_wf,
+                         resamples=data_cv,
+                         grid=svm_grid,
+                         metrics=metric_set(rmse))
+
+best_cost<-select_best(svml_tune_res)
+
+final_tune_svml_wf<-tune_svml_wf %>% 
+  finalize_workflow(best_cost)
+
+svml_fit<-final_tune_svml_wf %>% 
+  last_fit(split_data)
+
+v33<-svml_fit %>% collect_metrics()
+v33<-t(as.matrix(v33[,3]))
+
+## SVR non linaiare
+
+svm_rad_spec<- svm_rbf(cost=tune(),rbf_sigma=tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kernlab")
+
+svm_rad_wf<-
+  workflow() %>%
+  add_model(svm_rad_spec %>%  set_args(cost=tune(),rbf_sigma=tune())) %>%
+  add_recipe(rec)
+
+svm_rad_grid <- svm_rad_wf %>% 
+  parameters() %>%
+  grid_regular(levels=10)
+
+tune_res_svm_rad <- tune_grid(svm_rad_wf,
+                              resamples = data_cv,
+                              grid = svm_rad_grid,
+                              metrics=metric_set(rmse))
+
+svm_rad_best<-select_best(tune_res_svm_rad)
+
+svm_rad_final_wf<-svm_rad_wf %>% 
+  finalize_workflow(svm_rad_best)
+
+rad_svm_fit<-svm_rad_final_wf %>% 
+  last_fit(split_data)
+
+
+v44<-rad_svm_fit %>% collect_metrics()
+v44<-t(as.matrix(v44[,3]))
+
+
+## Régréssion linéaire
+
+
+lm_spec<-linear_reg() %>% set_engine("lm") %>%
+  set_mode("regression") 
+
+lm_wf<-workflow() %>% 
+  add_model(lm_spec) %>% 
+  add_recipe(rec)
+
+lm_fit<-lm_wf %>% 
+  last_fit(split_data)
+
+v55<-lm_fit %>% collect_metrics()
+v55<-t(as.matrix(v55[,3]))
+
+## KNN
+
+knn_spec<-nearest_neighbor(neighbors=tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kknn")
+
+tune_knn_wf<-workflow() %>% 
+  add_model(knn_spec) %>% 
+  add_recipe(rec)
+
+knn_grid<-grid_regular(neighbors(),levels=10)
+
+tune_res_knn<-tune_grid(tune_knn_wf,resamples=data_cv,
+                        grid=knn_grid,metrics = metric_set(rmse))
+
+knn_best<-select_best(tune_res_knn)
+
+final_tune_wf_knn<-tune_knn_wf %>% finalize_workflow(knn_best)
+
+knn_fit<-final_tune_wf_knn %>% last_fit(split_data)
+
+v66<-knn_fit %>% collect_metrics()
+v66<-t(as.matrix(v66[,3]))
+
+
+```
+
+
+```{r}
+vect1<-rbind(v1,v2,v3,v4,v5,v6)
+vect2<-rbind(v11,v22,v33,v44,v55,v66)
+tab_filtre<-cbind(vect1,vect2)
+tab_filtre<-tab_filtre %>% 
+  round(3)
+colnames(tab_filtre)=c("RMSE","R2","RMSE","R2")
+rownames(tab_filtre)=c("Arbre de régréssion","Forêt Aléatoire","SVR linéaire","SVR non linéaire","Régréssion linéaire","KNN")
+saveRDS(tab_filtre,file="C:/Users/basma/Desktop/Memoire/Dashbord/tableau_filtre_d1.RDS")
+cat(kbl(tab_filtre,booktabs = TRUE,format="latex",caption = "selection avec Filtre",align = 'c') %>% 
+  add_header_above(c("","sans séléction de variable"=2,"avec séléction de variables"=2)) %>%
+  kable_styling(latex_options = c("repeat_header")))
+```
+
+
+```{r}
+saveRDS(tab_filtre,file="C:/Users/basma/Desktop/Memoire/Dashbord/vect_sans_s_d1transf.RDS")
+```
+
+
+
+
+# Stepwise Séléction
+
+
+
+
+```{r}
+set.seed(1)
+data_trf<-recipe(G3~.,data=data) %>% 
+  step_dummy(all_factor_predictors()) %>% 
+  prep() %>% 
+  juice()
+Filtre <- which(rowSums(is.na(data))==0)
+data <- data[Filtre,]
+set.seed(1)
+split_data <- initial_split(data_trf, prop = 0.75, strata = G3)
+data_train<- training(split_data)
+data_test<- testing(split_data)
+data_cv<-vfold_cv(data_train)
+rec<-recipe(G3~.,data=data_train)
+```
+`
+
+
+```{r}
+set.seed(1)
+initial<-lm(G3~.,data=data_train)
+library(MASS)
+step<-stepAIC(initial, direction = "forward")
+step_names<-names(step$coefficients)
+step_names<-step_names[-1]
+```
+
+
+```{r}
+
+names<-colnames(data_trf)
+var_lm<-NULL
+for (i in 1:length(step_names)){
+var_lm[i]<-which(names==step_names[i])
+}
+
+```
+
+
+```{r}
+set.seed(1)
+split_data <- initial_split(data_trf[,c(var_lm,5)], prop = 0.75, strata = G3)
+data_train <- training(split_data)
+data_test <- testing(split_data)
+rec<-recipe(G3~.,data=data_train)
+data_cv<-vfold_cv(data_train)
+```
+
+
+
+```{r}
+lm_spec<-linear_reg() %>% set_engine("lm") %>%
+  set_mode("regression") 
+
+lm_wf<-workflow() %>% 
+  add_model(lm_spec) %>% 
+  add_recipe(rec)
+
+lm_fit<-lm_wf %>% 
+  last_fit(split_data)
+
+step_v5_f<-lm_fit %>% collect_metrics()
+step_v5_f<-t(as.matrix(step_v5_f[,3]))
+```
+
+step_5 <- both
+
+
+```{r}
+v5<-matrix(c(1.947,0.819),ncol=2)
+table_step<-rbind(v5,step_v5_bt,step_v5_b,step_v5_f) %>% 
+  round(3)
+
+rownames(table_step)<-c("Sans séléction de variables","Both direction","Backward direction","Forward direction")
+colnames(table_step)<-c("RMSE","R2")
+saveRDS(table_step,file="C:/Users/basma/Desktop/Memoire/Dashbord/tableau_step_1.RDS")
+cat(kbl(table_step,booktabs = TRUE,format="latex",caption = "selection avec stepwise",align = 'c') %>% 
+  kable_styling(latex_options = c("repeat_header")))
+
+```
+
+
+
+# Recursive Feathure élimination
+
+
+```{r}
+set.seed(1)
+ctrl<-rfeControl(
+  method="repeatedcv",
+  repeats = 1,
+  number=5,
+  functions=lmFuncs,
+)
+```
+
+
+```{r}
+lm_rfe<- rfe(
+  rec,
+  data = data_train,
+  sizes = c(2:71),
+  rfeControl = ctrl,
+  metric = "RMSE",
+)
+var_opti_rfe<-lm_rfe$optVariables
+```
+
+
+```{r}
+lmFuncs$
+```
+
+
+
+```{r}
+
+saveRDS(lm_rfe,file="C:/Users/basma/Desktop/Memoire/Dashbord/lmrfe.RDS")
+```
+
+
+
+```{r}
+names<-colnames(data_trf)
+var_lm<-NULL
+for (i in 1:length(var_opti_rfe)){
+var_lm[i]<-which(names==var_opti_rfe[i])
+}
+
+```
+
+
+
+
+```{r}
+set.seed(1)
+split_data <- initial_split(data_trf[,c(var_lm,5)], prop = 0.75, strata = G3)
+data_train <- training(split_data)
+data_test <- testing(split_data)
+rec<-recipe(G3~.,data=data_train)
+data_cv<-vfold_cv(data_train)
+```
+
+
+
+```{r}
+lm_spec<-linear_reg() %>% set_engine("lm") %>%
+  set_mode("regression") 
+
+lm_wf<-workflow() %>% 
+  add_model(lm_spec) %>% 
+  add_recipe(rec)
+
+lm_fit<-lm_wf %>% 
+  last_fit(split_data)
+
+rfe_v5<-lm_fit %>% collect_metrics()
+rfe_v5<-t(as.matrix(rfe_v5[,3]))
+```
+
+
+```{r}
+table_rfe<-cbind(v5,rfe_v5) %>% 
+  round(3)
+colnames(table_rfe)<-c("RMSE","R2","RMSE","R2")
+rownames(table_rfe)<-c("Arbre de Régréssion")
+saveRDS(table_rfe,file="C:/Users/basma/Desktop/Memoire/Dashbord/tableau_rfe_d1.RDS")
+cat(kbl(table_rfe,booktabs = TRUE,format="latex",caption = "selection avec rfe",align = 'c') %>% 
+  add_header_above(c("","sans séléction de variable"=2,"avec séléction de variables"=2)) %>%
+  kable_styling(latex_options = c("repeat_header")))
+```
+
+
+
+
